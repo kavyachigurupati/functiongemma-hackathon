@@ -1,239 +1,43 @@
-
 import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
-
-import json, os, re, time
-
-# Regex to detect round-hour phrasing like "10 AM", "6AM" (no explicit minutes)
-_ROUND_HOUR_RE = re.compile(r'\b(\d{1,2})\s*(am|pm)\b', re.I)
-_EXPLICIT_MINUTE_RE = re.compile(r'\b\d{1,2}:\d{2}')
-# ISO 8601 datetime — model sometimes emits these instead of "3:00 PM"
-_ISO_DATETIME_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T')
+import json, os, time, re
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
 
 
-# ── Action-intent keyword map for pre-flight analysis ────────────────────────
-# Maps intent category → distinctive keywords that appear in user requests.
-_ACTION_KEYWORDS = {
-    "weather":  ["weather", "forecast", "temperature"],
-    "alarm":    ["alarm", "wake"],
-    "message":  ["message", "text", "send"],
-    "reminder": ["remind"],
-    "contacts": ["contacts"],
-    "music":    ["play", "music", "song"],
-    "timer":    ["timer"],
-}
-
-
-def _preflight(messages, tools):
-    """
-    Checkpoint 1 — Pre-flight: Analyse request complexity before calling any model.
-
-    Detects how many distinct action categories the user is asking for.
-    If 2+ categories appear, the request likely requires multiple tool calls
-    (multi-intent), which FunctionGemma reliably fails at.
-    """
-    user_text = " ".join(m["content"] for m in messages if m["role"] == "user").lower()
-
-    matched_categories = set()
-    for category, keywords in _ACTION_KEYWORDS.items():
-        if any(kw in user_text for kw in keywords):
-            matched_categories.add(category)
-
-    return {
-        "matched_categories": matched_categories,
-        "num_actions": len(matched_categories),
-        "multi_intent": len(matched_categories) >= 2,
-        "num_tools": len(tools),
-    }
-
-
-def _get_tool_category(tool):
-    """Map a tool to its action category using its name and description."""
-    search_text = (tool["name"].replace("_", " ") + " " + tool.get("description", "")).lower()
-    for category, keywords in _ACTION_KEYWORDS.items():
-        if any(kw in search_text for kw in keywords):
-            return category
-    return None
-
-
-def _validate(result, tools, complexity, messages):
-    """
-    Checkpoint 2 — Post-flight: Inspect on-device output for correctness signals.
-
-    Checks:
-      1. At least one function call returned.
-      2. Multi-intent requests produce 2+ calls.
-      3. Every called function exists in the provided tool list.
-      4. All required parameters are present.
-      5. Integer-typed parameters carry actual integer values (not strings).
-      6. For multi-tool requests, the called function's category matches the user's
-         detected intent (catches wrong-tool selection by the small model).
-
-    Returns (is_valid: bool, reason: str).
-    """
-    calls = result.get("function_calls", [])
-    tool_map = {t["name"]: t for t in tools}
-    tool_names = set(tool_map)
-
-    # 1. Must produce at least one call
-    if not calls:
-        return False, "no_calls"
-
-    # 2. Multi-intent: expect 2+ calls
-    if complexity["multi_intent"] and len(calls) < 2:
-        return False, "multi_intent_needs_more_calls"
-
-    for call in calls:
-        fn_name = call.get("name", "")
-
-        # 3. Called function must exist in the tool list
-        if fn_name not in tool_names:
-            return False, f"unknown_function:{fn_name}"
-
-        tool = tool_map[fn_name]
-        props = tool["parameters"].get("properties", {})
-        required = tool["parameters"].get("required", [])
-        args = call.get("arguments", {})
-
-        # 4. All required parameters present
-        for req in required:
-            if req not in args:
-                return False, f"missing_required_param:{req}"
-
-        # 5. Integer parameters must carry integer values (not strings like "5")
-        for param, spec in props.items():
-            if param in args and spec.get("type") == "integer":
-                if not isinstance(args[param], int):
-                    return False, f"type_mismatch:{param}={repr(args[param])}_should_be_int"
-
-        # 6. Tool-specific semantic sanity checks
-        if fn_name == "set_alarm":
-            hour = args.get("hour")
-            minute = args.get("minute")
-            if isinstance(hour, int) and not (0 <= hour <= 23):
-                return False, f"alarm_hour_out_of_range:{hour}"
-            if isinstance(minute, int) and not (0 <= minute <= 59):
-                return False, f"alarm_minute_out_of_range:{minute}"
-            # If user said a round hour ("10 AM", "6 AM") without explicit minutes,
-            # the minute should be 0. Any other value means the model hallucinated.
-            user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
-            round_hour_match = _ROUND_HOUR_RE.search(user_text)
-            has_explicit_minute = bool(_EXPLICIT_MINUTE_RE.search(user_text))
-            if round_hour_match and not has_explicit_minute:
-                if isinstance(minute, int) and minute != 0:
-                    return False, f"alarm_minute_should_be_0_for_round_hour:{minute}"
-                # Also verify the hour in the response matches what the user asked
-                requested_hour = int(round_hour_match.group(1))
-                period = round_hour_match.group(2).lower()
-                if period == "pm" and requested_hour != 12:
-                    requested_hour += 12
-                elif period == "am" and requested_hour == 12:
-                    requested_hour = 0
-                if isinstance(hour, int) and hour != requested_hour:
-                    return False, f"alarm_hour_mismatch:{hour}_expected:{requested_hour}"
-
-        elif fn_name == "set_timer":
-            minutes = args.get("minutes")
-            if isinstance(minutes, int) and minutes <= 0:
-                return False, f"timer_minutes_non_positive:{minutes}"
-
-        elif fn_name == "create_reminder":
-            time_val = str(args.get("time", ""))
-            title_val = str(args.get("title", ""))
-            # Reject ISO 8601 datetime strings — model should produce "3:00 PM" style
-            if _ISO_DATETIME_RE.match(time_val):
-                return False, f"reminder_time_is_iso_datetime:{time_val}"
-            # Reject titles that begin with "Reminder" — model is just echoing the prompt
-            if title_val.lower().startswith("reminder"):
-                return False, f"reminder_title_has_filler_prefix:{title_val}"
-
-    # 6. Semantic intent check: only when multiple tools could be chosen
-    if len(tools) > 1 and complexity["matched_categories"]:
-        for call in calls:
-            fn_name = call.get("name", "")
-            tool = tool_map.get(fn_name)
-            if not tool:
-                continue
-            fn_category = _get_tool_category(tool)
-            # If the tool has a recognised category that doesn't match what the
-            # user asked for, the small model picked the wrong tool.
-            if fn_category is not None and fn_category not in complexity["matched_categories"]:
-                return False, f"intent_mismatch:{fn_name}(category:{fn_category})"
-
-    return True, "ok"
-
-
-def _generate_cactus_with_system(messages, tools, system_message):
-    """Run FunctionGemma on-device with a custom system message (for retries)."""
-    model = cactus_init(functiongemma_path)
-    cactus_tools = [{"type": "function", "function": t} for t in tools]
-
-    raw_str = cactus_complete(
-        model,
-        [{"role": "system", "content": system_message}] + messages,
-        tools=cactus_tools,
-        force_tools=True,
-        max_tokens=256,
-        stop_sequences=["<|im_end|>", "<end_of_turn>"],
-    )
-    cactus_destroy(model)
-
-    try:
-        raw = json.loads(raw_str)
-    except json.JSONDecodeError:
-        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
-
-    return {
-        "function_calls": raw.get("function_calls", []),
-        "total_time_ms": raw.get("total_time_ms", 0),
-        "confidence": raw.get("confidence", 0),
-    }
-
-
-def generate_cactus(messages, tools):
+def generate_cactus(messages, tools, system_msg="You are a helpful assistant that can use tools."):
     """Run function calling on-device via FunctionGemma + Cactus."""
     model = cactus_init(functiongemma_path)
-
-    cactus_tools = [{
-        "type": "function",
-        "function": t,
-    } for t in tools]
-
+    cactus_tools = [{"function": t} for t in tools]
     raw_str = cactus_complete(
         model,
-        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+        [{"role": "developer", "content": system_msg}] + messages,
         tools=cactus_tools,
         force_tools=True,
         max_tokens=256,
-        stop_sequences=["<|im_end|>", "<end_of_turn>"],
+        stop_sequences=["<end_of_turn>"],
+        confidence_threshold=0.0,
     )
-
     cactus_destroy(model)
-
     try:
-        raw = json.loads(raw_str)
+        patched_str = re.sub(r'([:\s\[,])0+(\d+)', r'\1\2', raw_str)
+        patched_str = re.sub(r'"true"|"false"|"TRUE"|"FALSE"', lambda m: m.group(0).lower().replace('"', ''), patched_str)
+        raw = json.loads(patched_str)
     except json.JSONDecodeError:
-        return {
-            "function_calls": [],
-            "total_time_ms": 0,
-            "confidence": 0,
-        }
-
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0, "cloud_handoff": False}
     return {
         "function_calls": raw.get("function_calls", []),
-        "total_time_ms": raw.get("total_time_ms", 0),
-        "confidence": raw.get("confidence", 0),
+        "total_time_ms":  raw.get("total_time_ms", 0),
+        "confidence":     raw.get("confidence", 0),
+        "cloud_handoff":  raw.get("cloud_handoff", False),
     }
 
 
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-
     gemini_tools = [
         types.Tool(function_declarations=[
             types.FunctionDeclaration(
@@ -251,34 +55,14 @@ def generate_cloud(messages, tools):
             for t in tools
         ])
     ]
-
     contents = [m["content"] for m in messages if m["role"] == "user"]
-
     start_time = time.time()
-
-    for attempt in range(3):
-        try:
-            gemini_response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    tools=gemini_tools,
-                    temperature=0.0,
-                    system_instruction=(
-                        "Use the EXACT words from the user's request as argument values. "
-                        "Do not paraphrase, expand contractions, or alter the wording. "
-                        "Do not add trailing periods or punctuation to extracted phrases."
-                    ),
-                ),
-            )
-            break
-        except Exception as e:
-            if attempt == 2:
-                raise
-            time.sleep(2 ** attempt)  # exponential back-off: 1s, 2s
-
+    gemini_response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=contents,
+        config=types.GenerateContentConfig(tools=gemini_tools),
+    )
     total_time_ms = (time.time() - start_time) * 1000
-
     function_calls = []
     for candidate in gemini_response.candidates:
         for part in candidate.content.parts:
@@ -287,107 +71,204 @@ def generate_cloud(messages, tools):
                     "name": part.function_call.name,
                     "arguments": dict(part.function_call.args),
                 })
-
-    return {
-        "function_calls": function_calls,
-        "total_time_ms": total_time_ms,
-    }
+    return {"function_calls": function_calls, "total_time_ms": total_time_ms}
 
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """
-    Multi-checkpoint hybrid routing strategy.
 
-    Checkpoint 1 — Pre-flight (before any model call):
-      Analyse the user's request for complexity signals.
-      - Multi-intent (2+ distinct action categories) → skip local entirely and
-        go straight to cloud. Small models consistently fail multi-call tasks.
+    # ══════════════════════════════════════════════════════════
+    # CHECKPOINT 1 — PRE-FLIGHT
+    # Analyze the request before calling any model.
+    # Uses 5 signals to decide if this is too complex for local.
+    # Zero model calls — pure text analysis, runs in microseconds.
+    # ══════════════════════════════════════════════════════════
 
-    Checkpoint 2 — Post-flight (after FunctionGemma returns):
-      Validate the local result structurally and semantically:
-        • Function exists in tool list (hallucination check)
-        • All required parameters present
-        • Integer params carry integer values, not strings
-        • For multi-tool requests: called function matches user's intent category
-      If valid, apply a relaxed confidence threshold:
-        • Single-tool requests: threshold = 0 (validation alone is sufficient)
-        • Multi-tool requests: threshold = 0.6
-      Trust the on-device result if it clears both hurdles.
+    # Get user message
+    user_message = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_message = m.get("content", "")
+            break
+    msg = user_message.lower()
 
-    Checkpoint 3 — Retry (before escalating to cloud):
-      If validation failed, re-run FunctionGemma with an explicit system prompt
-      that emphasises correct parameter types and tool selection.
-      Accept the retry on-device if it passes validation with confidence ≥ 0.5.
-      Only escalate to cloud if retry also fails.
-    """
+    # -- Signal 1: Message length --
+    word_count = len(user_message.split())
+    if word_count <= 8:
+        s_length = 0.0
+    elif word_count <= 20:
+        s_length = 0.2
+    elif word_count <= 40:
+        s_length = 0.5
+    else:
+        s_length = 0.8
 
-    # ── Checkpoint 1: Pre-flight complexity analysis ──────────────────────
-    complexity = _preflight(messages, tools)
+    # -- Signal 2: Action verb count --
+    action_verbs = [
+        "look up", "send", "text", "get", "check",
+        "find", "set", "create", "remind", "play",
+        "start", "search", "book", "wake", "call"
+    ]
+    found_verbs = []
+    for verb in sorted(action_verbs, key=len, reverse=True):
+        if " " in verb:
+            if verb in msg: found_verbs.append(verb)
+        else:
+            if re.search(rf"\b{verb}\b", msg): found_verbs.append(verb)
+    verb_count = len(found_verbs)
+    if verb_count <= 1: s_verbs = 0.0
+    elif verb_count == 2: s_verbs = 0.8
+    else: s_verbs = 1.0
 
-    if complexity["multi_intent"]:
-        # Multi-call tasks: go straight to cloud, no point running local first
+    # -- Explicit multi-step signal --
+    s_multi = 1.0 if (" and " in msg and verb_count > 1) or verb_count > 1 else 0.0
+
+    # -- Signal 3: Negations and conditionals --
+    # Small models ignore these and produce wrong calls.
+    neg_patterns  = [r"\bnot\b", r"\bnever\b", r"\bexcept\b", r"\bwithout\b", r"\bno\b"]
+    cond_patterns = [r"\bif\b", r"\bunless\b", r"\bonly\s+when\b", r"\bonly\s+if\b", r"\bwhen\b"]
+    neg_cond_hits = sum(1 for p in neg_patterns + cond_patterns if re.search(p, msg))
+    if neg_cond_hits == 0:
+        s_neg = 0.0
+    elif neg_cond_hits == 1:
+        s_neg = 0.3
+    elif neg_cond_hits == 2:
+        s_neg = 0.6
+    else:
+        s_neg = 0.9
+
+    # -- Signal 4: Tool count --
+    # More tools = harder selection for a small model.
+    tool_count = len(tools)
+    if tool_count <= 2:
+        s_tools = 0.0
+    elif tool_count <= 5:
+        s_tools = 0.2
+    elif tool_count <= 10:
+        s_tools = 0.5
+    else:
+        s_tools = 0.8
+
+    # -- Signal 5: Tool name/description similarity --
+    # Similar tools (set_alarm vs set_timer) cause confusion.
+    def jaccard(a, b):
+        wa, wb = set(a.lower().split()), set(b.lower().split())
+        return len(wa & wb) / len(wa | wb) if wa and wb else 0.0
+
+    descs = [f"{t.get('name','')} {t.get('description','')}" for t in tools]
+    max_sim = 0.0
+    for i in range(len(descs)):
+        for j in range(i + 1, len(descs)):
+            max_sim = max(max_sim, jaccard(descs[i], descs[j]))
+    if max_sim < 0.2:
+        s_sim = 0.0
+    elif max_sim < 0.4:
+        s_sim = 0.3
+    elif max_sim < 0.6:
+        s_sim = 0.6
+    else:
+        s_sim = 0.9
+
+    # -- Weighted composite score --
+    score = (
+        s_length * 0.10 +
+        s_verbs  * 0.20 +
+        s_multi  * 0.40 +
+        s_neg    * 0.20 +
+        s_tools  * 0.10 +
+        s_sim    * 0.10
+    )
+
+    # -- Route to cloud immediately if too complex --
+    if score >= 0.40:
         cloud = generate_cloud(messages, tools)
-        # Cloud completeness check: if fewer calls returned than detected intents,
-        # retry once with explicit N-call instruction.
-        if len(cloud.get("function_calls", [])) < complexity["num_actions"]:
-            retry_messages = messages + [{
-                "role": "user",
-                "content": (
-                    f"Important: this request requires EXACTLY {complexity['num_actions']} separate "
-                    f"function calls — one per action. Please call all {complexity['num_actions']} "
-                    f"relevant tools now."
-                )
-            }]
-            cloud2 = generate_cloud(retry_messages, tools)
-            # Only prefer retry if it returned more calls (strictly an improvement)
-            if len(cloud2.get("function_calls", [])) > len(cloud.get("function_calls", [])):
-                cloud2["source"] = "cloud (pre-flight: multi-intent)"
-                cloud2["total_time_ms"] += cloud["total_time_ms"]
-                return cloud2
-        cloud["source"] = "cloud (pre-flight: multi-intent)"
+        cloud["source"] = f"cloud (preflight score={score:.2f})"
         return cloud
 
-    # ── On-device inference ───────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # CHECKPOINT 2 — RUN LOCAL + POST-FLIGHT VALIDATION
+    # Run FunctionGemma locally, then validate the output.
+    # Check: valid function name, required params present, types ok.
+    # ══════════════════════════════════════════════════════════
     local = generate_cactus(messages, tools)
-    total_local_time = local["total_time_ms"]
+    available_names = {t["name"] for t in tools}
 
-    # ── Checkpoint 2: Post-flight validation ─────────────────────────────
-    valid, reason = _validate(local, tools, complexity, messages)
+    def is_valid(result):
+        calls = result.get("function_calls", [])
+        if not calls:
+            return False, "no function calls returned"
+        tools_by_name = {t["name"]: t for t in tools}
+        for call in calls:
+            name = call.get("name", "")
+            args = call.get("arguments", {})
+            if name not in tools_by_name:
+                return False, f"hallucinated tool name: {name}"
+            required = tools_by_name[name].get("parameters", {}).get("required", [])
+            for param in required:
+                if param not in args:
+                    return False, f"missing required param '{param}' in {name}"
+            props = tools_by_name[name].get("parameters", {}).get("properties", {})
+            for param, value in args.items():
+                if param not in props:
+                    continue
+                expected_type = props[param].get("type", "")
+                if expected_type == "integer" and not isinstance(value, int):
+                    try:
+                        int(str(value))
+                    except (ValueError, TypeError):
+                        return False, f"param '{param}' not coercible to int"
+                elif expected_type == "number" and not isinstance(value, (int, float)):
+                    try:
+                        float(str(value))
+                    except (ValueError, TypeError):
+                        return False, f"param '{param}' not coercible to number"
+                elif expected_type == "string":
+                    if str(value).strip() == "" and param in required:
+                        return False, f"required string param '{param}' is empty"
+                    elif str(value).strip() != "":
+                        val_clean = re.sub(r'[^\w\s]', '', str(value).lower()).strip()
+                        msg_clean = re.sub(r'[^\w\s]', '', msg).strip()
+                        if val_clean and val_clean not in msg_clean:
+                            words = val_clean.split()
+                            match_count = sum(1 for w in words if w in msg_clean)
+                            if match_count == 0:
+                                return False, f"hallucinated string not in prompt: {value}"
+        return True, "ok"
 
+    valid, reason = is_valid(local)
     if valid:
-        # Single-tool: if it passed validation the function + params are correct;
-        # confidence score adds no useful signal, so threshold = 0.
-        # Multi-tool: require moderate confidence on top of validation.
-        relaxed_threshold = 0.0 if complexity["num_tools"] == 1 else 0.6
-        if local["confidence"] >= relaxed_threshold:
-            local["source"] = "on-device"
-            return local
+        local["function_calls"] = [
+            c for c in local["function_calls"] if c.get("name") in available_names
+        ]
+        local["source"] = "on-device"
+        return local
 
-    # ── Checkpoint 3: Retry with enhanced system prompt ───────────────────
+    # ══════════════════════════════════════════════════════════
+    # CHECKPOINT 3 — RETRY LOCALLY WITH STRONGER PROMPT
+    # Before paying for a cloud call, retry once locally with
+    # a more explicit system prompt. Costs ~300ms but free.
+    # ══════════════════════════════════════════════════════════
     retry_system = (
-        "You are a precise function-calling assistant. "
-        "You MUST call one of the provided tools to fulfil the user's request. "
-        "IMPORTANT rules:\n"
-        "- Use integer values (not strings) for integer-type parameters.\n"
-        "- For alarms: if the user says '10 AM' with no minutes, set minute=0.\n"
-        "- For timers: minutes must be a positive integer.\n"
-        "- For reminders: use a short title (2-4 words) and a simple time like '3:00 PM'.\n"
-        "- Include every required parameter. Choose the tool that best matches the request."
+        "You MUST call one of the provided tools. "
+        "Do not write any text. Only call the most relevant tool."
     )
-    retry = _generate_cactus_with_system(messages, tools, retry_system)
-    total_local_time += retry["total_time_ms"]
-
-    valid_retry, _ = _validate(retry, tools, complexity, messages)
-    if valid_retry and retry["confidence"] >= 0.5:
-        retry["total_time_ms"] = total_local_time
+    retry = generate_cactus(messages, tools, system_msg=retry_system)
+    valid_retry, retry_reason = is_valid(retry)
+    if valid_retry:
+        retry["function_calls"] = [
+            c for c in retry["function_calls"] if c.get("name") in available_names
+        ]
         retry["source"] = "on-device (retry)"
+        retry["total_time_ms"] += local["total_time_ms"]
         return retry
 
-    # ── Cloud fallback ────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # FALLBACK — CLOUD
+    # Both local attempts failed validation. Escalate to Gemini.
+    # ══════════════════════════════════════════════════════════
     cloud = generate_cloud(messages, tools)
-    cloud["source"] = "cloud (fallback)"
+    cloud["source"] = "cloud (postflight fallback)"
     cloud["local_confidence"] = local.get("confidence", 0)
-    cloud["total_time_ms"] += total_local_time
+    cloud["total_time_ms"] += local["total_time_ms"] + retry["total_time_ms"]
     return cloud
 
 
@@ -407,7 +288,6 @@ def print_result(label, result):
 
 
 ############## Example usage ##############
-
 if __name__ == "__main__":
     tools = [{
         "name": "get_weather",
@@ -415,18 +295,12 @@ if __name__ == "__main__":
         "parameters": {
             "type": "object",
             "properties": {
-                "location": {
-                    "type": "string",
-                    "description": "City name",
-                }
+                "location": {"type": "string", "description": "City name"}
             },
             "required": ["location"],
         },
     }]
-
-    messages = [
-        {"role": "user", "content": "What is the weather in San Francisco?"}
-    ]
+    messages = [{"role": "user", "content": "What is the weather in San Francisco?"}]
 
     on_device = generate_cactus(messages, tools)
     print_result("FunctionGemma (On-Device Cactus)", on_device)
