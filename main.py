@@ -22,9 +22,7 @@ def generate_cactus(messages, tools, system_msg="You are a helpful assistant tha
     )
     cactus_destroy(model)
     try:
-        patched_str = re.sub(r'([:\s\[,])0+(\d+)', r'\1\2', raw_str)
-        patched_str = re.sub(r'"true"|"false"|"TRUE"|"FALSE"', lambda m: m.group(0).lower().replace('"', ''), patched_str)
-        raw = json.loads(patched_str)
+        raw = json.loads(raw_str)
     except json.JSONDecodeError:
         return {"function_calls": [], "total_time_ms": 0, "confidence": 0, "cloud_handoff": False}
     return {
@@ -103,24 +101,28 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         s_length = 0.8
 
     # -- Signal 2: Action verb count --
+    # Each action verb = one tool call the user wants.
+    # 2+ verbs = multi-step = small model will fail.
     action_verbs = [
         "look up", "send", "text", "get", "check",
         "find", "set", "create", "remind", "play",
-        "start", "search", "book", "wake", "call"
+        "start", "search", "book",
     ]
     found_verbs = []
     for verb in sorted(action_verbs, key=len, reverse=True):
         if " " in verb:
-            if verb in msg: found_verbs.append(verb)
+            if verb in msg:
+                found_verbs.append(verb)
         else:
-            if re.search(rf"\b{verb}\b", msg): found_verbs.append(verb)
+            if re.search(rf"\b{verb}\b", msg):
+                found_verbs.append(verb)
     verb_count = len(found_verbs)
-    if verb_count <= 1: s_verbs = 0.0
-    elif verb_count == 2: s_verbs = 0.8
-    else: s_verbs = 1.0
-
-    # -- Explicit multi-step signal --
-    s_multi = 1.0 if (" and " in msg and verb_count > 1) or verb_count > 1 else 0.0
+    if verb_count <= 1:
+        s_verbs = 0.0
+    elif verb_count == 2:
+        s_verbs = 0.8
+    else:
+        s_verbs = 1.0
 
     # -- Signal 3: Negations and conditionals --
     # Small models ignore these and produce wrong calls.
@@ -171,11 +173,10 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     # -- Weighted composite score --
     score = (
         s_length * 0.10 +
-        s_verbs  * 0.20 +
-        s_multi  * 0.40 +
+        s_verbs  * 0.40 +
         s_neg    * 0.20 +
         s_tools  * 0.10 +
-        s_sim    * 0.10
+        s_sim    * 0.20
     )
 
     # -- Route to cloud immediately if too complex --
@@ -221,17 +222,9 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                         float(str(value))
                     except (ValueError, TypeError):
                         return False, f"param '{param}' not coercible to number"
-                elif expected_type == "string":
-                    if str(value).strip() == "" and param in required:
+                elif expected_type == "string" and param in required:
+                    if str(value).strip() == "":
                         return False, f"required string param '{param}' is empty"
-                    elif str(value).strip() != "":
-                        val_clean = re.sub(r'[^\w\s]', '', str(value).lower()).strip()
-                        msg_clean = re.sub(r'[^\w\s]', '', msg).strip()
-                        if val_clean and val_clean not in msg_clean:
-                            words = val_clean.split()
-                            match_count = sum(1 for w in words if w in msg_clean)
-                            if match_count == 0:
-                                return False, f"hallucinated string not in prompt: {value}"
         return True, "ok"
 
     valid, reason = is_valid(local)
