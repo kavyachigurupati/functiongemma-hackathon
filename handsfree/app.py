@@ -71,36 +71,132 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ── Whisper (on-device transcription) ─────────────────────────────────────────
+_WHISPER_WEIGHTS = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "cactus", "weights", "whisper-small")
+)
+_WHISPER_PROMPT = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
+
+
+@st.cache_resource(show_spinner=False)
+def _load_whisper():
+    """Load and cache the Whisper model once per session."""
+    from cactus import cactus_init
+    return cactus_init(_WHISPER_WEIGHTS)
+
+
+# Warm up Whisper eagerly at app start (runs once, cached afterwards)
+if os.path.isdir(_WHISPER_WEIGHTS):
+    try:
+        _load_whisper()
+    except Exception:
+        pass
+
+
+_FFMPEG = "/opt/homebrew/bin/ffmpeg"
+
+
+def _to_16khz_wav(wav_bytes: bytes) -> bytes:
+    """Convert any audio bytes (WAV, FLAC, OGG, MP3, M4A …) to 16 kHz mono PCM WAV."""
+    import io, wave, subprocess, tempfile
+    import numpy as np
+
+    # ── 1. Try ffmpeg first — handles every format reliably ─────────────────
+    if os.path.isfile(_FFMPEG):
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as f:
+                f.write(wav_bytes)
+                tmp_in = f.name
+            tmp_out = tmp_in + ".wav"
+            subprocess.run(
+                [_FFMPEG, "-y", "-i", tmp_in,
+                 "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out],
+                check=True, capture_output=True,
+            )
+            with open(tmp_out, "rb") as f:
+                result = f.read()
+            return result
+        except Exception:
+            pass
+        finally:
+            for p in (tmp_in, tmp_out):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+    # ── 2. soundfile fallback (WAV, FLAC, OGG, AIFF) ─────────────────────
+    samples = None
+    framerate = None
+    try:
+        import soundfile as sf
+        samples, framerate = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
+        samples = samples.mean(axis=1)
+    except Exception:
+        pass
+
+    # ── 3. plain wave fallback (browser mic WAV) ──────────────────────────
+    if samples is None:
+        with wave.open(io.BytesIO(wav_bytes)) as r:
+            nchannels = r.getnchannels()
+            sampwidth = r.getsampwidth()
+            framerate = r.getframerate()
+            raw = r.readframes(r.getnframes())
+        if sampwidth == 1:
+            samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+        elif sampwidth == 4:
+            samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2_147_483_648.0
+        else:
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32_768.0
+        if nchannels > 1:
+            samples = samples.reshape(-1, nchannels).mean(axis=1)
+
+    # ── Resample to 16 kHz if needed ─────────────────────────────────────
+    if framerate != 16_000:
+        new_len = int(len(samples) * 16_000 / framerate)
+        samples = np.interp(
+            np.linspace(0, len(samples), new_len),
+            np.arange(len(samples)),
+            samples,
+        )
+
+    pcm = (samples * 32_767).clip(-32_768, 32_767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16_000)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def transcribe_audio(wav_bytes: bytes) -> tuple[str, float]:
-    """Transcribe audio bytes on-device via cactus_transcribe. Returns (text, ms)."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(wav_bytes)
-        tmp_path = f.name
-
+    """Transcribe audio bytes on-device via Whisper (cactus). Returns (text, ms)."""
     t0 = time.time()
     text = ""
+    tmp_path = None
     try:
-        # Try Python cactus API first
+        wav_16k = _to_16khz_wav(wav_bytes)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav_16k)
+            tmp_path = f.name
+
         from cactus import cactus_transcribe
-        text = cactus_transcribe(tmp_path)
-    except (ImportError, Exception):
-        try:
-            # Fallback: run cactus CLI
-            import subprocess
-            result = subprocess.run(
-                ["cactus", "transcribe", "--file", tmp_path],
-                capture_output=True, text=True, timeout=30,
-            )
-            text = result.stdout.strip()
-        except Exception:
-            text = ""
+        model = _load_whisper()
+        raw = cactus_transcribe(model, tmp_path, prompt=_WHISPER_PROMPT)
+        parsed = json.loads(raw)
+        text = parsed.get("response", "").strip()
+    except Exception as e:
+        st.warning(f"Transcription error: {e}")
+        text = ""
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
     elapsed = (time.time() - t0) * 1000
     return text, elapsed
@@ -226,17 +322,75 @@ col_input, col_pipeline = st.columns([3, 2])
 with col_input:
     st.markdown("### 🎤 Speak or Type a Command")
 
-    # ── Audio recorder ─────────────────────────────────────────────────────
-    st.markdown("**Record voice command:**")
-    audio_bytes = audio_recorder(
-        text="",
-        recording_color="#4ade80",
-        neutral_color="#374151",
-        icon_name="microphone",
-        icon_size="2x",
-        pause_threshold=2.0,
-        sample_rate=16000,
-    )
+    import hashlib, wave, io as _io
+
+    # ── Input mode tabs ─────────────────────────────────────────────────────
+    tab_mic, tab_file = st.tabs(["🎙️ Microphone", "📁 Upload Audio File"])
+
+    audio_bytes = None
+
+    with tab_mic:
+        st.markdown("**Record voice command** *(click mic, speak, click again to stop — auto-runs):*")
+        mic_bytes = audio_recorder(
+            text="",
+            recording_color="#4ade80",
+            neutral_color="#374151",
+            icon_name="microphone",
+            icon_size="2x",
+            pause_threshold=2.0,
+            sample_rate=16000,
+        )
+        if mic_bytes:
+            audio_bytes = mic_bytes
+            st.caption(f"Captured {len(mic_bytes)//1024} KB from mic")
+        else:
+            st.caption("🎤 Click the microphone to start recording")
+
+    with tab_file:
+        st.markdown("**Upload a WAV audio file to test transcription:**")
+        uploaded = st.file_uploader(
+            "Upload audio",
+            type=["wav", "mp3", "m4a", "ogg", "flac"],
+            label_visibility="collapsed",
+        )
+        if uploaded is not None:
+            raw = uploaded.read()
+            # Convert to WAV bytes if not already WAV
+            if not uploaded.name.lower().endswith(".wav"):
+                try:
+                    import subprocess, tempfile
+                    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(uploaded.name)[1], delete=False) as f:
+                        f.write(raw)
+                        tmp_in = f.name
+                    tmp_out = tmp_in + ".wav"
+                    subprocess.run(["ffmpeg", "-y", "-i", tmp_in, tmp_out], check=True,
+                                   capture_output=True)
+                    with open(tmp_out, "rb") as f:
+                        raw = f.read()
+                    os.unlink(tmp_in); os.unlink(tmp_out)
+                except Exception as e:
+                    st.warning(f"Could not convert to WAV ({e}). Trying as-is.")
+            audio_bytes = raw
+            st.audio(raw, format="audio/wav")
+            st.success(f"📁 File loaded: {uploaded.name} ({len(raw)//1024} KB)")
+
+    # Show mic feedback and auto-run on new audio
+    if audio_bytes:
+        audio_hash = hashlib.md5(audio_bytes).hexdigest()
+        # Parse duration
+        try:
+            with wave.open(_io.BytesIO(audio_bytes)) as _w:
+                _dur = _w.getnframes() / _w.getframerate()
+            dur_str = f"{_dur:.1f}s"
+        except Exception:
+            _dur = 0
+            dur_str = f"{len(audio_bytes)//1024}KB"
+        # Auto-trigger when audio is new
+        last_hash = st.session_state.get("_last_audio_hash", "")
+        if audio_hash != last_hash:
+            st.session_state["_last_audio_hash"] = audio_hash
+            st.session_state["_auto_run_audio"] = audio_bytes
+    
 
     # ── Text fallback ───────────────────────────────────────────────────────
     st.markdown("**…or type it:**")
@@ -276,8 +430,14 @@ if "injected_command" not in st.session_state:
 # Prefer injected example over text input
 command_text = st.session_state.get("injected_command") or text_input
 
+# Pull pending auto-run audio (set when new audio hash detected)
+_auto_audio = st.session_state.pop("_auto_run_audio", None)
+if _auto_audio:
+    audio_bytes = _auto_audio  # ensure it's set even if session-state driven
+
 # ── Run pipeline ───────────────────────────────────────────────────────────────
-if (run_btn or st.session_state.get("injected_command")) and (audio_bytes or command_text):
+auto_run = _auto_audio is not None
+if (run_btn or auto_run or st.session_state.get("injected_command")) and (audio_bytes or command_text):
 
     # Clear injected command after consuming it
     st.session_state["injected_command"] = ""
@@ -423,6 +583,11 @@ if (run_btn or st.session_state.get("injected_command")) and (audio_bytes or com
     with st.expander("🔍 Raw inference output"):
         st.json(inference_result)
 
+    # ── Allow re-recording after voice pipeline ───────────────────────────
+    if _auto_audio:
+        if st.button("🎙️ Record New Command", use_container_width=True):
+            st.session_state["_last_audio_hash"] = ""
+            st.rerun()
 
 # ── Sidebar: About ─────────────────────────────────────────────────────────────
 with st.sidebar:
