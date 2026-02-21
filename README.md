@@ -1,5 +1,3 @@
-<img src="assets/banner.png" alt="Logo" style="border-radius: 30px; width: 100%;">
-
 # HandsFree 🎙️
 
 **Voice-Controlled, Location-Aware Personal Agent**
