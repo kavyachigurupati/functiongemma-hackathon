@@ -26,6 +26,26 @@ def _get_gmaps():
     return _gmaps
 
 
+# Phrases that mean "use my current GPS location"
+_HERE_PHRASES = {
+    "near me", "my location", "my current location", "current location",
+    "here", "where i am", "where i'm at", "my position",
+}
+
+def _resolve_location(loc_str: str) -> str:
+    """
+    If loc_str is a 'near me' style phrase, replace it with the user's
+    real GPS coordinates (lat,lng string) suitable for geocoding/Maps APIs.
+    Otherwise return loc_str unchanged.
+    """
+    if loc_str.strip().lower() in _HERE_PHRASES:
+        from handsfree.location import get_gps_location
+        loc = get_gps_location()
+        if loc:
+            return f"{loc['lat']},{loc['lon']}"
+    return loc_str
+
+
 def execute(function_calls: list[dict]) -> list[dict]:
     """Execute a list of function calls and return results."""
     results = []
@@ -127,19 +147,31 @@ _WMO = {
 }
 
 def _get_weather(args):
-    location = args.get("location", "")
+    location = _resolve_location(args.get("location", ""))
     try:
-        # 1. Geocode via Nominatim (free, no key)
-        geo = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": location, "format": "json", "limit": 1},
-            headers={"User-Agent": "HandsFreeApp/1.0"},
-            timeout=5,
-        ).json()
-        if not geo:
-            raise ValueError(f"Location not found: {location}")
-        lat, lon = float(geo[0]["lat"]), float(geo[0]["lon"])
-        display = geo[0].get("display_name", location).split(",")[0]
+        # If location is already "lat,lon" (from 'near me' resolution), reverse geocode it
+        if location.count(",") == 1 and all(c in "0123456789.-, " for c in location):
+            parts = location.split(",")
+            lat, lon = float(parts[0].strip()), float(parts[1].strip())
+            rev = requests.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"lat": lat, "lon": lon, "format": "json"},
+                headers={"User-Agent": "HandsFreeApp/1.0"},
+                timeout=5,
+            ).json()
+            display = rev.get("address", {}).get("city") or rev.get("display_name", location).split(",")[0]
+        else:
+            # 1. Geocode city name via Nominatim (free, no key)
+            geo = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": location, "format": "json", "limit": 1},
+                headers={"User-Agent": "HandsFreeApp/1.0"},
+                timeout=5,
+            ).json()
+            if not geo:
+                raise ValueError(f"Location not found: {location}")
+            lat, lon = float(geo[0]["lat"]), float(geo[0]["lon"])
+            display = geo[0].get("display_name", location).split(",")[0]
 
         # 2. Fetch weather from Open-Meteo (free, no key)
         wx = requests.get(
@@ -175,8 +207,8 @@ def _get_weather(args):
 
 
 def _get_directions(args):
-    origin      = args.get("origin", "Current location")
-    destination = args.get("destination", "")
+    origin      = _resolve_location(args.get("origin", "") or "Current location")
+    destination = _resolve_location(args.get("destination", ""))
     mode        = args.get("mode", "driving")
     try:
         gmaps = _get_gmaps()
@@ -217,14 +249,18 @@ def _get_directions(args):
 
 def _find_nearby(args):
     category = args.get("category", "")
-    location = args.get("location", "")
+    location = _resolve_location(args.get("location", ""))
     try:
         gmaps = _get_gmaps()
-        # Geocode the location string first
-        geo = gmaps.geocode(location)
-        if not geo:
-            raise ValueError(f"Cannot geocode: {location}")
-        latlng = geo[0]["geometry"]["location"]  # {lat, lng}
+        # If already lat,lng from _resolve_location, pass directly; else geocode
+        if location.count(",") == 1 and all(c in "0123456789.-, " for c in location):
+            parts = location.split(",")
+            latlng = {"lat": float(parts[0].strip()), "lng": float(parts[1].strip())}
+        else:
+            geo = gmaps.geocode(location)
+            if not geo:
+                raise ValueError(f"Cannot geocode: {location}")
+            latlng = geo[0]["geometry"]["location"]
 
         places = gmaps.places_nearby(
             location=latlng,
@@ -253,8 +289,8 @@ def _find_nearby(args):
 
 def _search_along_route(args):
     query       = args.get("query", "")
-    origin      = args.get("origin", "")
-    destination = args.get("destination", "")
+    origin      = _resolve_location(args.get("origin", ""))
+    destination = _resolve_location(args.get("destination", ""))
     try:
         gmaps = _get_gmaps()
         # Get route polyline
